@@ -3,6 +3,7 @@
   <component name="ProjectModuleManager">
     <modules>
       <module fileurl="file://$PROJECT_DIR$/BitcoinScan.iml" filepath="$PROJECT_DIR$/BitcoinScan.iml" />
+      <module fileurl="file://$PROJECT_DIR$/../EthereumWallet/EthereumWallet.iml" filepath="$PROJECT_DIR$/../EthereumWallet/EthereumWallet.iml" />
     </modules>
   </component>
 </project>
