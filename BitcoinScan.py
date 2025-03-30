@@ -1,88 +1,122 @@
+import hashlib
+import base58
 import requests
 import time
-from mnemonic import Mnemonic
-import bip32utils
-import hashlib
-import bech32
+import random
+from ecdsa import SigningKey, SECP256k1
+from bech32 import bech32_encode, convertbits
 
-# Function to convert 128-bit binary to a mnemonic
-def binary_to_mnemonic(binary_str):
-    hex_str = hex(int(binary_str, 2))[2:].zfill(32)  # Ensure it's padded to 32 hex digits (128 bits)
-    mnemo = Mnemonic("english")
-    mnemonic_phrase = mnemo.to_mnemonic(bytes.fromhex(hex_str))
-    return mnemonic_phrase
 
-# Function to derive addresses for BIP44, BIP49, and BIP84
-def derive_addresses(mnemonic):
-    seed = Mnemonic.to_seed(mnemonic)
-    master_key = bip32utils.BIP32Key.fromEntropy(seed)
+def generate_random_private_key():
+    return f"{random.getrandbits(256):064x}"
 
-    bip44_key = master_key.ChildKey(44 + bip32utils.BIP32_HARDEN).ChildKey(0 + bip32utils.BIP32_HARDEN).ChildKey(0 + bip32utils.BIP32_HARDEN).ChildKey(0).ChildKey(0)
-    bip44_address = bip44_key.Address()
 
-    bip49_key = master_key.ChildKey(49 + bip32utils.BIP32_HARDEN).ChildKey(0 + bip32utils.BIP32_HARDEN).ChildKey(0 + bip32utils.BIP32_HARDEN).ChildKey(0).ChildKey(0)
-    bip49_address = bip49_key.P2WPKHoP2SHAddress()
+def private_key_to_wif(private_key_hex, compressed=True):
+    private_key_bytes = bytes.fromhex(private_key_hex)
+    if compressed:
+        private_key_bytes += b'\x01'
+    extended_key = b'\x80' + private_key_bytes
+    checksum = hashlib.sha256(hashlib.sha256(extended_key).digest()).digest()[:4]
+    return base58.b58encode(extended_key + checksum).decode('utf-8')
 
-    bip84_key = master_key.ChildKey(84 + bip32utils.BIP32_HARDEN).ChildKey(0 + bip32utils.BIP32_HARDEN).ChildKey(0 + bip32utils.BIP32_HARDEN).ChildKey(0).ChildKey(0)
-    pubkey = bip84_key.PublicKey()
-    bech32_address = pubkey_to_bech32_address(pubkey)
 
-    return bip44_address, bip49_address, bech32_address
+def private_key_to_public_key(private_key_hex, compressed=True):
+    private_key_bytes = bytes.fromhex(private_key_hex)
+    sk = SigningKey.from_string(private_key_bytes, curve=SECP256k1)
+    vk = sk.get_verifying_key()
+    
+    x, y = vk.pubkey.point.x(), vk.pubkey.point.y()
+    if compressed:
+        prefix = b'\x02' if y % 2 == 0 else b'\x03'
+        return prefix + x.to_bytes(32, byteorder='big')  
+    
+    return b'\x04' + vk.to_string()
 
-def pubkey_to_bech32_address(pubkey):
-    sha256_hash = hashlib.sha256(pubkey).digest()
-    ripemd160_hash = hashlib.new('ripemd160', sha256_hash).digest()
-    return bech32.encode('bc', 0, ripemd160_hash)
 
-# Function to get transaction count for a given Bitcoin address using blockchain.com API
-def get_transaction_count_detailed(address):
+def public_key_to_legacy_address(public_key):
+    public_key_hash = hashlib.new('ripemd160', hashlib.sha256(public_key).digest()).digest()
+    address = b'\x00' + public_key_hash
+    checksum = hashlib.sha256(hashlib.sha256(address).digest()).digest()[:4]
+    return base58.b58encode(address + checksum).decode('utf-8')
+
+
+def public_key_to_bech32_address(public_key):
+    public_key_hash = hashlib.new('ripemd160', hashlib.sha256(public_key).digest()).digest()
+    witness_version = 0
+    data = [witness_version] + convertbits(public_key_hash, 8, 5, pad=True)  
+    return bech32_encode('bc', data)
+
+
+def get_transaction_count(address):
     try:
-        url = f"https://blockchain.info/address/{address}?format=json"
+        url = f"https://blockstream.info/api/address/{address}"
         response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+        return data.get("chain_stats", {}).get("tx_count", 0)
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching transaction count for {address}: {e}")
+        return None
 
-        if response.status_code == 200:
-            data = response.json()
-            return data.get("n_tx", 0)  # Get the transaction count
-        else:
-            print(f"Error fetching transaction count: {response.status_code}")
-            return 0
-    except Exception as e:
-        print(f"Exception occurred: {str(e)}")
-        return 0
 
-# Function to generate binary sequence, mnemonic, and wallet addresses for each
-def generate_binary_mnemonic_and_addresses(starting_binary):
-    start_int = int(starting_binary, 2)
-    api_call_count = 0  # Counter for API calls
-    start_time = time.time()  # Track time for periodic printing
+def generate_addresses_with_transactions(start_private_key_hex, iterations=10):
+    private_key_hex = start_private_key_hex
+    api_calls = 0
+    start_time = time.time()
+    loop_start_time = start_time
 
-    while True:  # Nonstop loop
-        current_binary = bin(start_int)[2:].zfill(128)
-        mnemonic = binary_to_mnemonic(current_binary)
-        bip44_address, bip49_address, bech32_address = derive_addresses(mnemonic)
+    for i in range(iterations):
+        try:
+            # Generate public keys
+            public_key_compressed = private_key_to_public_key(private_key_hex, compressed=True)
+            public_key_uncompressed = private_key_to_public_key(private_key_hex, compressed=False)
 
-        # Delay for 12 seconds before each address check
-        time.sleep(2)
+            # Generate addresses
+            legacy_compressed_address = public_key_to_legacy_address(public_key_compressed)
+            legacy_uncompressed_address = public_key_to_legacy_address(public_key_uncompressed)
+            bech32_address = public_key_to_bech32_address(public_key_compressed)
 
-        # Check transaction counts for each address
-        for address in [bip44_address, bip49_address, bech32_address]:
-            transaction_count = get_transaction_count_detailed(address)
-            api_call_count += 1  # Increment API call count
-            if transaction_count > 0:
-                print(f"Binary: {current_binary}")
-                print(f"Mnemonic: {mnemonic}")
-                print(f"Address: {address}")
-                print(f"Number of Transactions: {transaction_count}\n")
+            # Fetch transaction counts
+            legacy_compressed_tx_count = get_transaction_count(legacy_compressed_address)
+            legacy_uncompressed_tx_count = get_transaction_count(legacy_uncompressed_address)
+            bech32_tx_count = get_transaction_count(bech32_address)
 
-        # Increment the integer for the next binary string
-        start_int += 1
+            api_calls += 3 
 
-        # Print the number of API calls made every 30 seconds
-        if time.time() - start_time >= 30:  # Check if 30 seconds have passed
-            print(f"Number of API calls made: {api_call_count}")
-            start_time = time.time()  # Reset timer
+            
+            if (legacy_compressed_tx_count and legacy_compressed_tx_count > 0) or \
+               (legacy_uncompressed_tx_count and legacy_uncompressed_tx_count > 0) or \
+               (bech32_tx_count and bech32_tx_count > 0):
 
-# Example usage
-starting_binary = '10001101100100010001101000011011010100100100001110101011100110001101000110101110010011000101011000011000101111011100101001110111'
+                print(f"🔑 Private Key: {private_key_hex}")
 
-generate_binary_mnemonic_and_addresses(starting_binary)
+                if legacy_compressed_tx_count and legacy_compressed_tx_count > 0:
+                    print(f"📌 Legacy Compressed Address: {legacy_compressed_address}, Transactions: {legacy_compressed_tx_count}")
+                if legacy_uncompressed_tx_count and legacy_uncompressed_tx_count > 0:
+                    print(f"📌 Legacy Uncompressed Address: {legacy_uncompressed_address}, Transactions: {legacy_uncompressed_tx_count}")
+                if bech32_tx_count and bech32_tx_count > 0:
+                    print(f"📌 Bech32 Address: {bech32_address}, Transactions: {bech32_tx_count}")
+
+        except Exception as e:
+            print(f"Error processing private key {private_key_hex}: {e}")
+
+      
+        private_key_int = int(private_key_hex, 16) + 1
+        private_key_hex = f"{private_key_int:064x}"
+        
+       
+        if time.time() - loop_start_time >= 296:
+            private_key_hex = generate_random_private_key()
+            loop_start_time = time.time()
+
+        
+        if time.time() - start_time >= 20:
+            print(f" Total API calls made: {api_calls}")
+            start_time = time.time()
+
+        time.sleep(1)  
+
+
+# Run the function with an initial private key #000000000000000000000000000000 Up to here
+start_private_key_hex = "eba81430b6f0cef7d0ee4d2b92ec353571705dc0a6fdb06b40b63aa2f903fd18"
+generate_addresses_with_transactions(start_private_key_hex, iterations=1300000)
